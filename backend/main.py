@@ -218,6 +218,90 @@ def preprocess_image_soft(image: Image.Image) -> Image.Image:
     return Image.fromarray(contrast)
 
 
+def snap_orientation_angle(angle: int) -> int:
+    normalized = angle % 360
+    return min(
+        (0, 90, 180, 270),
+        key=lambda candidate: min(abs(candidate - normalized), 360 - abs(candidate - normalized)),
+    )
+
+
+def parse_osd_orientation(osd_text: str) -> dict[str, Any]:
+    angle = 0
+    confidence = 0.0
+
+    for line in osd_text.splitlines():
+        if line.startswith("Orientation in degrees:"):
+            angle = snap_orientation_angle(safe_int(line.split(":", 1)[1].strip()))
+        elif line.startswith("Orientation confidence:"):
+            confidence = max(0.0, min(1.0, safe_float(line.split(":", 1)[1].strip(), 0.0) / 10.0))
+
+    return {"angle": angle, "confidence": round(confidence, 2), "method": "osd"}
+
+
+def reduced_for_orientation(image: Image.Image, max_side: int = 1000) -> Image.Image:
+    working = ImageOps.exif_transpose(image).convert("RGB")
+    longest_side = max(working.size)
+    if longest_side <= max_side:
+        return working
+
+    scale = max_side / longest_side
+    return working.resize(
+        (max(1, int(working.width * scale)), max(1, int(working.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+
+
+def score_orientation_image(image: Image.Image) -> float:
+    try:
+        processed = preprocess_image_soft(image)
+        _, words = ocr_words_from_image(processed)
+        return score_ocr_words(words)
+    except Exception:
+        return -1.0
+
+
+def detect_orientation(image: Image.Image) -> dict[str, Any]:
+    working = reduced_for_orientation(image)
+
+    try:
+        osd = pytesseract.image_to_osd(working)
+        orientation = parse_osd_orientation(osd)
+        if orientation["confidence"] > 0:
+            return orientation
+    except Exception:
+        pass
+
+    scores: dict[int, float] = {}
+    for angle in (0, 90, 180, 270):
+        candidate = working if angle == 0 else working.rotate(-angle, expand=True)
+        scores[angle] = score_orientation_image(candidate)
+
+    best_angle = max(scores, key=scores.get)
+    best_score = scores[best_angle]
+    if best_score <= 0:
+        return {"angle": 0, "confidence": 0.0, "method": "none"}
+
+    ordered_scores = sorted(scores.values(), reverse=True)
+    runner_up = ordered_scores[1] if len(ordered_scores) > 1 else 0.0
+    confidence = min(1.0, max(0.1, (best_score - runner_up) / max(best_score, 1.0)))
+    return {"angle": best_angle, "confidence": round(confidence, 2), "method": "sweep"}
+
+
+def correct_orientation(image: Image.Image, angle: int) -> Image.Image:
+    base_image = ImageOps.exif_transpose(image).convert("RGB")
+    normalized_angle = snap_orientation_angle(angle)
+    if normalized_angle == 0:
+        return base_image
+    return base_image.rotate(-normalized_angle, expand=True)
+
+
+def prepare_ocr_display_image(image: Image.Image) -> tuple[Image.Image, dict[str, Any]]:
+    base_image = ImageOps.exif_transpose(image).convert("RGB")
+    orientation = detect_orientation(base_image)
+    return correct_orientation(base_image, orientation["angle"]), orientation
+
+
 def clamp_ratio(value: float) -> float:
     return max(0.0, min(1.0, round(value, 6)))
 
@@ -516,12 +600,22 @@ def ocr_words_from_image(image: Image.Image) -> tuple[str, list[dict[str, Any]]]
     return build_ocr_words(ocr_data)
 
 
-def ocr_image_page(image: Image.Image, page_number: int) -> dict[str, Any]:
-    primary_processed = preprocess_image(image)
+def ocr_image_page(
+    image: Image.Image,
+    page_number: int,
+    prepared: bool = False,
+) -> dict[str, Any]:
+    if prepared:
+        display_image = ImageOps.exif_transpose(image).convert("RGB")
+        orientation = {"angle": 0, "confidence": 1.0, "method": "precorrected"}
+    else:
+        display_image, orientation = prepare_ocr_display_image(image)
+
+    primary_processed = preprocess_image(display_image)
     text, words = ocr_words_from_image(primary_processed)
 
     if score_ocr_words(words) < 55:
-        fallback_processed = preprocess_image_soft(image)
+        fallback_processed = preprocess_image_soft(display_image)
         fallback_text, fallback_words = ocr_words_from_image(fallback_processed)
         if score_ocr_words(fallback_words) > score_ocr_words(words):
             primary_processed = fallback_processed
@@ -534,6 +628,8 @@ def ocr_image_page(image: Image.Image, page_number: int) -> dict[str, Any]:
         "ocr_words": words,
         "width": float(primary_processed.width),
         "height": float(primary_processed.height),
+        "rotation_applied": orientation["angle"],
+        "_display_image": display_image,
     }
 
 
@@ -548,13 +644,119 @@ def extract_image_pages(file_bytes: bytes, file_type: str) -> list[dict[str, Any
             for index, page in enumerate(document, start=1):
                 pixmap = page.get_pixmap(alpha=False)
                 image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
-                pages.append(ocr_image_page(image, index))
+                payload = ocr_image_page(image, index)
+                payload.pop("_display_image", None)
+                pages.append(payload)
             return pages
         finally:
             document.close()
 
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    return [ocr_image_page(image, 1)]
+    payload = ocr_image_page(image, 1)
+    payload.pop("_display_image", None)
+    return [payload]
+
+
+def extract_image_pages_with_previews(
+    file_bytes: bytes,
+    file_type: str,
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    """Combined OCR + preview generation using the SAME display image.
+
+    This prevents bbox misalignment caused by running orientation
+    detection independently for OCR and preview (non-deterministic
+    detection could yield different rotation angles).
+    """
+    if not ocr_is_available():
+        raise ValueError("OCR engine unavailable")
+
+    if file_type == "pdf":
+        document = fitz.open(stream=file_bytes, filetype="pdf")
+        try:
+            page_count = document.page_count
+            page_payloads: list[dict[str, Any]] = []
+            previews: list[dict[str, Any]] = []
+
+            for index in range(min(page_count, MAX_RASTER_PAGES)):
+                page = document.load_page(index)
+                pixmap = page.get_pixmap(alpha=False)
+                image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+                page_payload = ocr_image_page(image, index + 1)
+                display_image = page_payload.pop("_display_image")
+                page_payloads.append(page_payload)
+                previews.append(
+                    {
+                        "page_number": index + 1,
+                        **encode_preview_image(display_image),
+                    }
+                )
+
+            return page_payloads, page_count, previews
+        finally:
+            document.close()
+
+    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    page_payload = ocr_image_page(image, 1)
+    display_image = page_payload.pop("_display_image")
+    previews = [
+        {
+            "page_number": 1,
+            **encode_preview_image(display_image),
+        }
+    ]
+    return [page_payload], 1, previews
+
+
+def encode_preview_image(image: Image.Image) -> dict[str, Any]:
+    preview_image = ImageOps.exif_transpose(image).convert("RGB")
+    width, height = preview_image.size
+    if width > MAX_PREVIEW_WIDTH:
+        ratio = MAX_PREVIEW_WIDTH / width
+        preview_image = preview_image.resize(
+            (MAX_PREVIEW_WIDTH, max(1, int(height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+
+    buffer = io.BytesIO()
+    preview_image.save(buffer, format="PNG")
+    return {
+        "image_b64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+        "width": preview_image.width,
+        "height": preview_image.height,
+    }
+
+
+def extract_pdf_ocr_pages_with_previews(
+    file_bytes: bytes,
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    if not ocr_is_available():
+        raise ValueError("OCR engine unavailable")
+
+    document = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        page_count = document.page_count
+        page_payloads: list[dict[str, Any]] = []
+        previews: list[dict[str, Any]] = []
+
+        for index in range(min(page_count, MAX_RASTER_PAGES)):
+            page = document.load_page(index)
+            pixmap = page.get_pixmap(alpha=False)
+            image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            display_image, orientation = prepare_ocr_display_image(image)
+            page_payload = ocr_image_page(display_image, index + 1, prepared=True)
+            page_payload.pop("_display_image", None)
+            page_payload["rotation_applied"] = orientation["angle"]
+            page_payloads.append(page_payload)
+            previews.append(
+                {
+                    "page_number": index + 1,
+                    **encode_preview_image(display_image),
+                }
+            )
+
+        return page_payloads, page_count, previews
+    finally:
+        document.close()
 
 
 def union_word_boxes(
@@ -968,25 +1170,19 @@ def render_pdf_page_preview(page: fitz.Page) -> dict[str, Any]:
 
 
 def build_image_previews(file_bytes: bytes) -> tuple[int, list[dict[str, Any]]]:
+    """Standalone preview builder. Prefer extract_image_pages_with_previews()
+    to guarantee OCR and preview share the same orientation-corrected image."""
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    width, height = image.size
-    if width > MAX_PREVIEW_WIDTH:
-        ratio = MAX_PREVIEW_WIDTH / width
-        image = image.resize((MAX_PREVIEW_WIDTH, max(1, int(height * ratio))), Image.Resampling.LANCZOS)
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    display_image, _ = prepare_ocr_display_image(image)
     return 1, [
         {
             "page_number": 1,
-            "image_b64": base64.b64encode(buffer.getvalue()).decode("ascii"),
-            "width": image.width,
-            "height": image.height,
+            **encode_preview_image(display_image),
         }
     ]
 
 
-def cache_findings(file_digest: str, findings: list[dict[str, Any]]) -> None:
+def cache_findings(file_digest: str, findings: list[dict[str, Any]], mode: str) -> None:
     keys_to_delete = [key for key in scan_cache if key[0] == file_digest]
     for key in keys_to_delete:
         scan_cache.pop(key, None)
@@ -995,6 +1191,7 @@ def cache_findings(file_digest: str, findings: list[dict[str, Any]]) -> None:
         scan_cache[(file_digest, finding["id"])] = {
             "page": finding["page"],
             "bbox": finding["bbox"],
+            "mode": mode,
         }
 
 
@@ -1015,6 +1212,7 @@ def render_redacted_pdf(file_bytes: bytes, file_type: str, finding_ids: list[str
     for entry in entries:
         redactions_by_page[entry["page"]].append(entry["bbox"])
 
+    render_mode = entries[0].get("mode") if entries else None
     output = fitz.open()
 
     if file_type == "pdf":
@@ -1024,12 +1222,15 @@ def render_redacted_pdf(file_bytes: bytes, file_type: str, finding_ids: list[str
                 page = document.load_page(index)
                 pixmap = page.get_pixmap(alpha=False)
                 image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+                if render_mode == "ocr_image":
+                    image, _ = prepare_ocr_display_image(image)
                 draw_redactions(image, redactions_by_page.get(index + 1, []))
                 append_image_page(output, image)
         finally:
             document.close()
     else:
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        image, _ = prepare_ocr_display_image(image)
         draw_redactions(image, redactions_by_page.get(1, []))
         append_image_page(output, image)
 
@@ -1108,20 +1309,21 @@ async def scan(file: UploadFile = File(...)) -> Response:
             joined_text = "".join(page["text"] for page in page_payloads).strip()
             if joined_text:
                 mode = "pdf_text"
+                page_count, pages = build_pdf_previews(file_bytes)
             else:
-                page_payloads = extract_image_pages(file_bytes, detected_type)
                 mode = "ocr_image"
-            page_count, pages = build_pdf_previews(file_bytes)
+                page_payloads, page_count, pages = extract_pdf_ocr_pages_with_previews(file_bytes)
         else:
-            page_payloads = extract_image_pages(file_bytes, detected_type)
+            page_payloads, page_count, pages = extract_image_pages_with_previews(
+                file_bytes, detected_type
+            )
             mode = "ocr_image"
-            page_count, pages = build_image_previews(file_bytes)
 
         findings = collect_regex_findings(page_payloads, mode)
         if mode == "ocr_image" and not "".join(page["text"] for page in page_payloads).strip():
             return error_response(400, "no_text_extracted")
 
-        cache_findings(file_hash(file_bytes), findings)
+        cache_findings(file_hash(file_bytes), findings, mode)
         payload = {
             "mode": mode,
             "page_count": page_count,
