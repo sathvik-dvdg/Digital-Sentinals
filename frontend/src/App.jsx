@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useReducer } from 'react'
+import { useAuth } from '@clerk/clerk-react'
 import ActionBar from './components/ActionBar.jsx'
 import CompletionScreen from './components/CompletionScreen.jsx'
 import DocumentViewer from './components/DocumentViewer.jsx'
@@ -81,6 +82,7 @@ function buildDownloadName(fileName) {
 
 export default function App() {
   const [state, dispatch] = useReducer(appReducer, initialState)
+  const { getToken } = useAuth()
 
   useEffect(() => {
     let ignore = false
@@ -150,11 +152,18 @@ export default function App() {
     const hardTimer = window.setTimeout(() => controller.abort(), HARD_TIMEOUT_MS)
 
     try {
+      const token = await getToken()
       const formData = new FormData()
       formData.append('file', file)
 
+      const headers = {}
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
       const response = await fetch('/api/scan', {
         method: 'POST',
+        headers,
         body: formData,
         signal: controller.signal,
       })
@@ -212,12 +221,19 @@ export default function App() {
     }
 
     try {
+      const token = await getToken()
       const formData = new FormData()
       formData.append('file', state.file)
       formData.append('finding_ids', JSON.stringify(Array.from(state.maskedIds)))
 
+      const headers = {}
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
       const response = await fetch('/api/redact', {
         method: 'POST',
+        headers,
         body: formData,
       })
 
@@ -246,8 +262,10 @@ export default function App() {
       : 'All previewable pages are shown.'
 
   return (
-    <div className="app-shell">
+    <div className="dashboard-shell">
       <MockBanner visible={state.mockMode} />
+
+      {/* Dashboard header replaces old topbar — now inside Layout's <Outlet> */}
       <header className="topbar">
         <div>
           <p className="eyebrow">Privacy-first document workflow</p>
