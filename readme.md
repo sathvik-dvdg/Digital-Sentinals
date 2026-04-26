@@ -133,17 +133,6 @@ npm run dev
 
 *(Note: Press `Ctrl + Shift + D` at any time to force Demo Mode if the backend is offline).*
 
-## 📸 Demo
-### Screenshots
-> *Placeholder: Add your stunning UI screenshots here.*
-![Dashboard Preview](https://via.placeholder.com/800x400.png?text=Dashboard+Preview)
-
-### Demo Video
-> *Placeholder: Add a link or GIF of your application in action.*
-
-### Live Link
-> *[Insert Live Deployment Link Here (If applicable)]*
-
 ## 🔮 Future Improvements
 - [ ] **Advanced Machine Learning**: Implement zero-shot learning models running via WebAssembly in the browser for fully offline NLP detection.
 - [ ] **Custom Rulesets**: Allow organizations to define custom regex patterns for proprietary IDs.
