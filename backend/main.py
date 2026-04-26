@@ -14,7 +14,7 @@ import pytesseract
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageOps
 from pytesseract import Output
 
 # Configure Logging
@@ -32,19 +32,8 @@ MAX_PREVIEW_WIDTH = 1000
 PII_PATTERNS = {
     "aadhaar": r"\b[0-9]{4}\s[0-9]{4}\s[0-9]{4}\b", 
     "pan":     r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b",
-    "voter_id": r"\b[A-Z]{3}[0-9]{7}\b",
     "phone":   r"\b(?:\+91[\-\s]?)?[6-9]\d{9}\b",
-    "email":   r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
-    "ean_13":  r"\b\d{13}\b",      # Standard 13-digit Barcode
-    "upc_a":   r"\b\d{12}\b"
-
-}
-
-# 1. Step 2: Validation Patterns (Already in your PII_PATTERNS)
-BARCODE_VALIDATORS = {
-    "ean_13": r"^\d{13}$",
-    "upc_a": r"^\d{12}$",
-    "qr_code": r".+" # QRs can be any string, but we validate existence
+    "email":   r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
 }
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -52,11 +41,8 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 SEVERITY_MAP = {
     "aadhaar": "high",
     "pan":     "high",
-    "voter_id": "high",
     "phone":   "medium",
-    "email":   "medium",
-    "ean_13": "medium",
-    "upc_a": "medium"
+    "email":   "medium"
 }
 
 # Application Init
@@ -90,8 +76,6 @@ def mask_value(pii_type: str, raw: str) -> str:
         return f"XXXX-XXXX-{raw[-4:]}"
     if pii_type == "pan":
         return f"XXXXX{raw[5:9]}X"
-    if pii_type == "voter_id":
-        return f"{raw[:3]}XXXXXXX"
     if pii_type == "phone":
         clean = re.sub(r'\D', '', raw)
         return f"XXXXXX{clean[-4:]}"
@@ -101,9 +85,8 @@ def mask_value(pii_type: str, raw: str) -> str:
     return "XXXX"
 
 def preprocess_image(img: Image.Image) -> Image.Image:
-    """Preprocessor: Autocontrast and Sharpening to help OCR."""
-    img = ImageOps.autocontrast(img.convert("RGB"))
-    return img.filter(ImageFilter.SHARPEN) # Helps OCR see barcode numbers better
+    """Preprocessor: Autocontrast only (no denoising)."""
+    return ImageOps.autocontrast(img.convert("RGB"))
 
 def encode_preview(img: Image.Image) -> str:
     """Resizes and encodes rasterized page to base64."""
@@ -164,7 +147,6 @@ async def scan(file: UploadFile = File(...)):
         file_bytes = await file.read()
         
         if len(file_bytes) > MAX_FILE_SIZE:
-            logger.warning(f"Rejected file: Size is over {MAX_FILE_SIZE} bytes")
             return JSONResponse({"error": "file_too_large"}, status_code=400)
             
         digest = file_hash(file_bytes)
@@ -248,7 +230,6 @@ async def scan(file: UploadFile = File(...)):
                 
             text = " ".join(text_parts)
             if not text.strip():
-                logger.warning(f"Rejected image: Tesseract found 0 readable words.")
                 return JSONResponse({"error": "no_text_extracted", "detail": "No readable text found in the image."}, status_code=400)
 
             page_payloads.append({"page_number": 1, "text": text, "words": words, "w": img.width, "h": img.height})
@@ -280,87 +261,6 @@ async def scan(file: UploadFile = File(...)):
                     findings.append(finding)
                     # Cache raw coords for redaction
                     scan_cache[(digest, finding_id)] = {"page": pp["page_number"], "bbox": bbox}
-
-        # 3. ADVANCED: Barcode/QR Detection (Resilient Engine + Validation)
-        try:
-            import zxingcpp
-            import cv2
-            import numpy as np
-
-            scan_targets = []
-            if not is_pdf:
-                # Use the ORIGINAL high-res bytes here
-                img_original = Image.open(io.BytesIO(file_bytes)).convert('RGB')
-                scan_targets.append((1, img_original))
-            else:
-                for page_data in pages_output:
-                    img_bytes = base64.b64decode(page_data["image_b64"])
-                    scan_targets.append((page_data["page_number"], Image.open(io.BytesIO(img_bytes)).convert('RGB')))
-
-            for page_num, img_target in scan_targets:
-                # Convert PIL Image (RGB) to OpenCV format (BGR)
-                cv_img = cv2.cvtColor(np.array(img_target), cv2.COLOR_RGB2BGR)
-                gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-
-                # --- PASS 1: Adaptive Thresholding (Handles shadows and complex backgrounds) ---
-                binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                             cv2.THRESH_BINARY, 11, 2)
-                
-                results = zxingcpp.read_barcodes(binary)
-                
-                # --- PASS 2: Morphological Dilation (Closes gaps in blurry QR codes) ---
-                if not results:
-                    kernel = np.ones((3,3), np.uint8)
-                    dilated = cv2.dilate(binary, kernel, iterations=1)
-                    results = zxingcpp.read_barcodes(dilated)
-
-                # --- PASS 3: Original Image (Last resort) ---
-                if not results:
-                    results = zxingcpp.read_barcodes(cv_img)
-
-                for result in results:
-                    raw_text = result.text
-                    
-                    # --- VALIDATION/PARSING (Using Regex) ---
-                    detected_type = "barcode"
-                    
-                    if re.match(BARCODE_VALIDATORS["ean_13"], raw_text):
-                        detected_type = "ean_13"
-                    elif re.match(BARCODE_VALIDATORS["upc_a"], raw_text):
-                        detected_type = "upc_a"
-                    elif result.format in [zxingcpp.BarcodeFormat.QRCode, zxingcpp.BarcodeFormat.MicroQRCode]:
-                        detected_type = "qr_code"
-
-                    finding_id = str(uuid.uuid4())
-                    pos = result.position
-                    
-                    pts = [pos.top_left, pos.top_right, pos.bottom_right, pos.bottom_left]
-                    min_x = min(p.x for p in pts)
-                    max_x = max(p.x for p in pts)
-                    min_y = min(p.y for p in pts)
-                    max_y = max(p.y for p in pts)
-
-                    bbox = {
-                        "x": max(0.0, min(1.0, min_x / img_target.width)),
-                        "y": max(0.0, min(1.0, min_y / img_target.height)),
-                        "w": max(0.0, min(1.0, (max_x - min_x) / img_target.width)),
-                        "h": max(0.0, min(1.0, (max_y - min_y) / img_target.height))
-                    }
-                    
-                    findings.append({
-                        "id": finding_id,
-                        "type": detected_type,
-                        "value": f"[{detected_type.upper()} REDACTED]",
-                        "raw_value": raw_text,
-                        "page": page_num,
-                        "severity": "high" if detected_type == "qr_code" else "medium",
-                        "confidence": 0.99,
-                        "bbox": bbox
-                    })
-                    scan_cache[(digest, finding_id)] = {"page": page_num, "bbox": bbox}
-
-        except Exception as e:
-            logger.error(f"Advanced QR Engine failed: {e}")
 
         high_count = sum(1 for f in findings if f["severity"] == "high")
         med_count = sum(1 for f in findings if f["severity"] == "medium")
